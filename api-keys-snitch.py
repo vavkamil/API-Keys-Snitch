@@ -1,32 +1,13 @@
 #!/usr/bin/env python3
 
-#
-#
-#
+import re
+from array import array
+from java.io import PrintWriter
 
-#
-#
-#
-#
-
-from burp import IExtensionStateListener
+from burp import IScanIssue
 from burp import IBurpExtender
 from burp import IScannerCheck
-from burp import IScanIssue
-from java.io import PrintWriter
-from array import array
-import re
-
-#
-#
-#
-#
-#
-#
-#
-#
-
-#
+from burp import IExtensionStateListener
 
 
 regexes = {
@@ -34,11 +15,6 @@ regexes = {
     "Google Captcha": "6L[0-9A-Za-z-_]{38}|^6[0-9a-zA-Z_-]{39}$",
     "Google OAuth": "ya29\.[0-9A-Za-z\-_]+",
     "Facebook Access Token": "EAACEdEose0cBA[0-9A-Za-z]+",
-    # "": "",
-    # "": "",
-    # "": "",
-    # "": "",
-    # "": "",
 }
 
 
@@ -47,24 +23,15 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener):
     #
     # implement IBurpExtender
     #
-
     def registerExtenderCallbacks(self, callbacks):
-        # keep a reference to our callbacks object
         self._callbacks = callbacks
-
-        # obtain an extension helpers object
         self._helpers = callbacks.getHelpers()
 
-        # set our extension name
-        callbacks.setExtensionName("API Keys Snitch")
-
-        # obtain our output stream
+        callbacks.setExtensionName("API Keys Snitch with Semgrep Patterns")
         self._stdout = PrintWriter(callbacks.getStdout(), True)
 
-        # register ourselves as a custom scanner check
+        # Register scanner checks & extension state listener
         callbacks.registerScannerCheck(self)
-
-        # register ourselves as an extension state listener
         callbacks.registerExtensionStateListener(self)
 
         # Print out some credits
@@ -72,131 +39,115 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener):
         self._stdout.println("Twitter: https://twitter.com/vavkamil")
         self._stdout.println("Blog: https://vavkamil.cz")
         self._stdout.println("")
-        self._stdout.println("Successfully initialized!")
 
     #
     # implement IExtensionStateListener
     #
-
     def extensionUnloaded(self):
         self._stdout.println("Extension was unloaded")
 
-    # helper method to search a response for occurrences of a literal match string
-    # and return a list of start/end offsets
-
+    #
+    # Helper method to locate a literal match within response bytes
+    #
     def _get_matches(self, response, match):
         matches = []
         start = 0
         reslen = len(response)
-        print("x", response)
         matchlen = len(match)
+
         while start < reslen:
             start = self._helpers.indexOf(response, match, True, start, reslen)
             if start == -1:
                 break
             matches.append(array("i", [start, start + matchlen]))
             start += matchlen
-
         return matches
 
     #
     # implement IScannerCheck
     #
-
     def doPassiveScan(self, baseRequestResponse):
-        # look for matches of our passive check grep string
+        # Only scan if the response is likely JS (by extension and/or content-type)
+        request_info = self._helpers.analyzeRequest(baseRequestResponse)
+        url = request_info.getUrl()
+        path = url.getPath() if url else ""
+
+        # Simple approach: if not .js, ignore
+        if not path.endswith(".js"):
+            return None
+
+        # Also check the Content-Type
+        response_info = self._helpers.analyzeResponse(baseRequestResponse.getResponse())
+        headers = response_info.getHeaders()
+        content_type_js = any(
+            "Content-Type: application/javascript" in h
+            or "Content-Type: text/javascript" in h
+            for h in headers
+        )
+        # If it doesn't look like JS, skip as well
+        if not content_type_js and not path.endswith(".js"):
+            return None
+
+        response_bytes = baseRequestResponse.getResponse()
+        if not response_bytes:
+            return None
+
+        response_str = self._helpers.bytesToString(response_bytes)
+
         scan_issues = []
-        print("1", self._helpers.bytesToString(baseRequestResponse.getResponse()))
+        # Check each regex
+        for regex_name, pattern_str in regexes.items():
+            pattern = re.compile(pattern_str)
+            found_strings = pattern.findall(response_str)
+            if not found_strings:
+                continue
 
-        for r in regexes.items():
-            regex_name = r[0]
-            regex_pattern = r[1]
+            # If the regex uses a capturing group, sometimes findall() returns tuples
+            # For a single capture group, found_strings might look like ['match1','match2'] or
+            # a list of tuples. We can normalize:
+            if isinstance(found_strings[0], tuple):
+                # Flatten each tuple to pick the first capturing group
+                found_strings = [m[0] for m in found_strings]
 
-            regex = re.compile(regex_pattern)
-            matches = regex.findall(
-                self._helpers.bytesToString(baseRequestResponse.getResponse())
-            )
+            # Create one issue per match
+            for found_string in found_strings:
+                offsets = self._get_matches(response_bytes, found_string)
+                if not offsets:
+                    continue
 
-            for match in matches:
-                print(match)
-                matches = self._get_matches(baseRequestResponse.getResponse(), match)
+                detail_msg = (
+                    "The response contains a <strong>{}</strong>: <strong>{}</strong><br><br>"
+                    "Regex pattern used: <strong>{}</strong>"
+                ).format(regex_name, found_string, pattern_str)
 
-                if len(matches) == 0:
-                    return None
-
-                print(matches)
-                # report the issue
                 scan_issues.append(
                     CustomScanIssue(
                         baseRequestResponse.getHttpService(),
-                        self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                        request_info.getUrl(),
                         [
                             self._callbacks.applyMarkers(
-                                baseRequestResponse, None, matches
+                                baseRequestResponse, None, offsets
                             )
                         ],
-                        "The response contains the <strong>%s</strong> key: <strong>%s</strong> <br><br>found via: <strong>%s</strong> regex."
-                        % (regex_name, match, regex_pattern),
+                        detail_msg,
                     )
                 )
-        return scan_issues
+
+        return scan_issues if scan_issues else None
 
     def doActiveScan(self, baseRequestResponse):
-        scan_issues = []
-        print(
-            "1 Active", self._helpers.bytesToString(baseRequestResponse.getResponse())
-        )
-
-        for r in regexes.items():
-            regex_name = r[0]
-            regex_pattern = r[1]
-
-            regex = re.compile(regex_pattern)
-            matches = regex.findall(
-                self._helpers.bytesToString(baseRequestResponse.getResponse())
-            )
-
-            for match in matches:
-                print(" Active", match)
-                matches = self._get_matches(baseRequestResponse.getResponse(), match)
-
-                if len(matches) == 0:
-                    return None
-
-                print(" Active", matches)
-                # report the issue
-                scan_issues.append(
-                    CustomScanIssue(
-                        baseRequestResponse.getHttpService(),
-                        self._helpers.analyzeRequest(baseRequestResponse).getUrl(),
-                        [
-                            self._callbacks.applyMarkers(
-                                baseRequestResponse, None, matches
-                            )
-                        ],
-                        "The response contains the <strong>%s</strong> key: <strong>%s</strong> <br><br>found via: <strong>%s</strong> regex."
-                        % (regex_name, match, regex_pattern),
-                    )
-                )
-        return scan_issues
+        """For many secrets checks, passive is sufficient.
+        But here we mirror the same approach if you still want it in activeScan."""
+        return self.doPassiveScan(baseRequestResponse)
 
     def consolidateDuplicateIssues(self, existingIssue, newIssue):
-        # This method is called when multiple issues are reported for the same URL
-        # path by the same extension-provided check. The value we return from this
-        # method determines how/whether Burp consolidates the multiple issues
-        # to prevent duplication
-        #
-        # Since the issue name is sufficient to identify our issues as different,
-        # if both issues have the same name, only report the existing issue
-        # otherwise report both issues
         if existingIssue.getIssueDetail() == newIssue.getIssueDetail():
-            return -1
-
-        return 0
+            return -1  # -1 => Only report the existing issue
+        return 0  #  0 => Report both issues
 
 
 #
-# class implementing IScanIssue to hold our custom scan issue details
+# Class implementing IScanIssue to hold our custom scan issue details
 #
 class CustomScanIssue(IScanIssue):
     def __init__(self, httpService, url, httpMessages, detail):
@@ -221,17 +172,18 @@ class CustomScanIssue(IScanIssue):
         return "Certain"
 
     def getIssueBackground(self):
-        # pass
         return """
-            Sometimes API Keys used within the websites are not properly restricted, or even overprivileged.<br>
-            Make sure that you test them manually, to verify that they are used properly according to the documentation.<br><br>
-            For example, <a href='https://github.com/streaak/keyhacks' target='_blank'>KeyHacks</a> shows ways in which particular API keys can be used, to check if they are valid.
+            Sometimes API Keys used within websites are not properly restricted or over-privileged.<br>
+            Make sure to test them manually to verify correct usage and scoping.<br><br>
+            For example, <a href='https://github.com/streaak/keyhacks' target='_blank'>KeyHacks</a> shows ways
+            in which particular API keys can be checked for validity or privileges.
         """
 
     def getRemediationBackground(self):
-        # pass
         return """
-            Read the docs and don't be stupid!
+            - Rotate your keys regularly.
+            - Restrict them to necessary permissions only.
+            - Avoid committing them in client-side JavaScript whenever possible.
         """
 
     def getIssueDetail(self):
